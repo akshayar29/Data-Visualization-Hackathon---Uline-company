@@ -1,0 +1,292 @@
+---
+title: "OMIS_data visualization"
+author: "Akshaya Rajendran"
+date: "2023-04-05"
+output: 
+output: 
+  pdf_document:
+    
+    'theme: flatly
+    toc: TRUE
+    toc_float: TRUE
+    code_download: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE, cache=F}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  error = TRUE,
+  warning = FALSE,
+  message = FALSE)
+```
+
+# Initial libraries to be loaded which would help our further R coding
+# Requirements
+
+```{r}
+#install.packages("tidyverse")
+#install.packages("tidygeocoder")
+#install.packages("zipcodeR")
+#install.packages("leafelet")
+#install.packages("devtools")
+#devtools::install_github("rstudio/leaflet", force = T)
+
+library(tidyverse)
+library(readxl)
+library(zipcodeR)
+library(sparklyr)
+library(leaflet)
+
+```
+
+Our project's goal is to identify the new distribution location for Uline company to increase their delivery performance
+We are being provided with a dataset containing the info of ZIP_FROM(Distribution center), ZIP_TO(Customer location), DISTANCE_METERS(distance from the Distribution center to the customer location), TIME_SECONDS(time taken to complete the delivery from Distribution center to Customer location) and ZIP_TO_LAT and ZIP_TO_LON(Coordinates of the Customer locations)
+First step for our analysis is to load the dataset into R studio
+
+### Read csv data from the excel sheet provided and create dataset
+```{r}
+# Let's import the dataset of the Uline into R and name it as war_data
+war_data<- read_excel("Uline distribution center delivery data.xlsx",sheet = "delivery_times_by_warehouse", col_names = T)
+
+# After importing the datset, we see there are more blank values. We will remove the blank values such that dataset will be refined better for analysis
+war_data<- war_data %>% na.omit()
+
+```
+
+# Plotting in maps
+```{r}
+#Mapping the ZIP_TO(Customer location) coordinates per each Zip_from i.e the distribution center
+
+war_data %>% 
+  ggplot(aes(x=ZIP_TO_LON, y=ZIP_TO_LAT))+
+  geom_point(aes(color=as.factor(ZIP_FROM)))
+
+#From the US map plotted, we are unable to distinguish the customer locations serviced by each distribution centers. 
+```
+
+Before deciding the location for new distribution center, let us analyse the data by doing some computations on the data.
+In order to do faster computations, let's use Spark. 
+First step is to create spark connection.
+# Spark connection
+```{r}
+#Creating spark connection
+sc <- spark_connect(master = "local")
+
+#Copying war_data from R into Spark and naming it as warehouse_spark
+warehouse_spark <- copy_to(sc, war_data)
+warehouse_spark
+
+```
+
+# Spark compuatations
+In the dataset given, we see the distance in meters and time in seconds. Let's convert them to standard units of miles and hours respectively
+
+```{r}
+#Converting the Distance column given in meters to miles and time column given in seconds to hours
+
+warehouse_spark <- warehouse_spark %>% 
+  mutate(DISTANCE_MILES = DISTANCE_METERS/1609,
+         TIME_HOURS = TIME_SECONDS/3600)
+
+```
+
+Computing the average time and distance serviced per each distribution center. And then we calculate the time difference and distance difference as,
+time_diff = TIME_HOURS - mean(TIME_HOURS)
+distance_diff = DISTANCE_MILES - mean(DISTANCE_MILES)
+
+```{r}
+#Computing time_diff and distance_diff
+warehouse_spark <- warehouse_spark %>% 
+  group_by(ZIP_FROM) %>% 
+  mutate(time_diff = TIME_HOURS - mean(TIME_HOURS, na.rm = T),
+         distance_diff = DISTANCE_MILES - mean(DISTANCE_MILES, na.rm = T)) %>% 
+  collect() %>% 
+  print()
+
+```
+Now lets sort the dataset having higher time_diff and distance_diff first
+
+```{r}
+#Sorting the dataset in descending order of the distance difference and time difference
+war_time_diff <- warehouse_spark %>% 
+  group_by(ZIP_TO) %>% 
+  arrange(desc(distance_diff), desc(time_diff))
+
+```
+
+Assuming the ZIP_TO locations having negative time difference as the quickly serviced locations in terms of time and negative distance difference as nearest locations to Distribution centers. Based on this assumption, we are filtering only the ZIP_TO locations that have some delays. Here ZIP_TO locations having positive time difference and distance difference are considered as delays.
+
+```{r}
+#Filtering the dataset such that it has only the locations which has positive time_diff and distance_diff. 
+war_time_diff <- war_time_diff %>% 
+  filter(time_diff > 0 & distance_diff>0)
+
+```
+
+Adding the nearby city names for the distribution centers for better reading of the visualizations and data
+```{r}
+#Adding the nearby city names to the distribution center(Zip_from) for better visualizations
+war_time_diff <- war_time_diff %>% 
+  group_by(ZIP_FROM) %>% 
+  mutate(Distribution_center = case_when(
+                                ZIP_FROM == 18106 ~ "Allentown",
+                                ZIP_FROM == 30517 ~ "Atlanta",
+                                ZIP_FROM == 53144 ~ "Chicago",
+                                ZIP_FROM == 54016 ~ "Minneapolis",
+                                ZIP_FROM == 75261 ~ "Dallas",
+                                ZIP_FROM == 91762 ~ "LosAngeles",
+                                TRUE ~ "Seattle"
+  ))
+
+```
+
+Now we will compute the number of customer locations serviced by each distribution center
+
+```{r}
+#Computing the total number of locations serviced by each distribution center that has more time and distance than the average distance and time
+war_time_diff %>% 
+  group_by(Distribution_center) %>% 
+  summarise(count = n())
+
+```
+
+From the results, we find that Seattle and LosAngeles are servicing more locations. But we cannot decide based on the number of locations serviced.  
+
+By studying the dataset, we can also see that one Zip_To/Customer location is serviced by more than distribution center.
+
+```{r}
+#Computing the number of distribution center servicing each location
+service <- war_time_diff %>% 
+  group_by(ZIP_TO) %>% 
+  summarise_at(vars(ZIP_FROM), list(count_servicloc = ~n()))
+
+```
+From the results, we can see that on an average, each customer location is atleast serviced by 3 distribution centers which are experiencing delays. 
+
+Lets try visulaizing the locations serviced by each distribution center in US Map
+
+```{r}
+#Visualizing the Zip_to locations serviced per warehouse location
+war_time_diff %>% 
+  ggplot(aes(x=ZIP_TO_LON, y=ZIP_TO_LAT))+
+  geom_point(aes(color= Distribution_center))
+
+```
+
+In order to find the efficiency of each distribution center, lets calculate the average time difference and average distance difference for each distribution center. This average time difference will tell us the delivery performances of the distribution centers in terms of time.
+
+```{r}
+war_time_diff %>% 
+  group_by(Distribution_center) %>% 
+  summarise(avg_time_diff = mean(time_diff),
+            avg_distance_diff = mean(distance_diff))
+
+```
+
+Lets filter the dataset having time differences more than the average time differences. The filtered data is assumed to have customer locations having more delayed deliveries
+```{r}
+#Filter time_diff greater than avg of time_diff
+war_time_diff <- war_time_diff %>% 
+  group_by(ZIP_FROM) %>% 
+  filter(time_diff > mean(time_diff))
+
+```
+
+Lets try visualizing the avg time differences of distribution centers
+
+```{r}
+#Visualizing the avg time differences of distribution centers
+
+war_time_diff %>% 
+  group_by(Distribution_center) %>% 
+  summarise(count = n(),
+            avg_time_diff = round(mean(time_diff),2)) %>% 
+  print() %>% 
+  ggplot(aes(x=Distribution_center, y= avg_time_diff))+
+  geom_col(aes(fill = Distribution_center))+
+  geom_text(aes(label = avg_time_diff), vjust = -0.5)
+
+```
+
+From the chart, we see the distribution centers Allentown and Atlanta are having average time difference of 24.23 and 22.71. These two distribution centers are having more delayed deliveries
+
+My suggestion to have new distribution center should be in the south to minimize the workloads of these two distribution centers
+
+Before deciding the location for the new distribution center, lets visualize the distribution centers in US map.
+
+In order to plot the location of distribution center, lets gather the coordinates of distribution centers
+
+```{r}
+#Gathering coordinates for the ZIP_FROM i.e the distribution centers from the built-in zip_code_db
+Zipcode_coordinates <-zip_code_db %>% 
+  filter(zipcode == "18106" | zipcode=="30517" | zipcode=="53144" | zipcode=="54016" | zipcode=="75261" | zipcode=="91762" | zipcode=="98516") %>% 
+  select(zipcode,state,lat,lng)
+
+#Renaming the column names for better conventions
+names(Zipcode_coordinates)[1] <- "ZIP_FROM"
+names(Zipcode_coordinates)[2] <- "ZIP_FROM_State"
+names(Zipcode_coordinates)[3] <- "ZIP_FROM_LAT"
+names(Zipcode_coordinates)[4] <- "ZIP_FROM_LON"
+
+#Adding the Distribution center names from war_time_diff dataset to the Zipcode coordinates dataset which can be used for plotting the distribution centers in the US map
+Zipcode_coordinates <- merge(Zipcode_coordinates, (war_time_diff %>% select(ZIP_FROM, Distribution_center) %>% unique()), by = "ZIP_FROM")
+
+#We were not able to get the coordinates for the zipcode "75261" from zipcode_db and also using the geocode function. Hence manually adding the coordinates which I got for the ULine distribution center at Dallas
+Zipcode_coordinates[Zipcode_coordinates$ZIP_FROM == "75261", "ZIP_FROM_LAT"] <- 32.851172637018124
+Zipcode_coordinates[Zipcode_coordinates$ZIP_FROM == "75261", "ZIP_FROM_LON"] <- -97.02327012020498
+
+view(Zipcode_coordinates)
+
+```
+
+Using the leaflet package to map the locations of distribution centers
+
+```{r}
+#Plotting the Distribution center locations in US Map using the leaflet package
+map <- leaflet() %>%
+  addTiles()
+
+for (i in 1:nrow(Zipcode_coordinates)) {
+  map <- addMarkers(map, 
+                    lng = Zipcode_coordinates[i, "ZIP_FROM_LON"], 
+                    lat = Zipcode_coordinates[i, "ZIP_FROM_LAT"], 
+                    label = Zipcode_coordinates$Distribution_center[i],
+                    labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE,
+                                                style = list("color" = "black", "font-size" = "15px")))
+}
+
+map
+```
+
+Based on the map, my suggestion would be to have the new distribution center in state of Florida.
+
+```{r}
+# Highlighting Florida state and marking Miami
+map <- map %>% 
+    addRectangles(
+    lng1=-79.97431, lat1=31.00089,
+    lng2=-87.63488, lat2=24.52310,
+    fillColor = "transparent"
+  )
+
+#And also suggesting to have the distribution center nearby Miami. Hence marking Miami
+
+map <- map %>% 
+  addMarkers(lng = -80.1918, 
+             lat = 25.7617, 
+             label = "Miami",
+             labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE,
+                                                style = list("color" = "black",   "font-size" = "15px")))
+
+map
+
+```
+
+
+
+
+
+
